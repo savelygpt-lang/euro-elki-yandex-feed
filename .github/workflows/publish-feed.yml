@@ -1,0 +1,65 @@
+name: Update Yandex product feed
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 */3 * * *'
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "yandex-feed-pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run regression tests
+        run: python -m unittest tests.test_yandex_yml -v
+      - name: Build XML from Tilda and verify 44+ canonical products
+        run: |
+          python scripts/build_yandex_yml.py --output site/catalog.xml
+          python - <<'PY'
+          from xml.etree import ElementTree as ET
+          root=ET.parse('site/catalog.xml').getroot()
+          offers=root.findall('.//offers/offer')
+          assert len(offers)>=44, "Too few offers: fail closed"
+          assert all(o.get('available') == 'true' for o in offers)
+          print(f"VALIDATED {len(offers)} offers")
+          PY
+          touch site/.nojekyll
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Upload validated feed
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+      - name: Publish to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Monthly repository activity heartbeat
+        if: ${{ github.event_name == 'schedule' }}
+        continue-on-error: true
+        run: |
+          MONTH="$(date -u +%Y-%m)"
+          printf 'Latest month: %s\n' "$MONTH" > .feed-activity
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .feed-activity
+          if ! git diff --staged --quiet; then
+            git commit -m "Keep scheduled feed updates active ($MONTH)"
+            git push origin HEAD:main
+          fi
