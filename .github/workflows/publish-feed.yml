@@ -37,7 +37,7 @@ jobs:
           root=ET.parse('site/catalog.xml').getroot()
           offers=root.findall('.//offers/offer')
           assert len(offers)>=44, "Too few offers: fail closed"
-          assert all(o.get('available') == 'true' for o in offers)
+          assert all(o.get('available') in ('true', 'false') and o.find('count') is None for o in offers)
           print(f"VALIDATED {len(offers)} offers")
           PY
           touch site/.nojekyll

@@ -24,10 +24,11 @@ class YandexYMLTests(unittest.TestCase):
     def test_all_unique_active_product_urls(self):
         root, report = self.make()
         offers = root.findall('.//offers/offer')
-        self.assertEqual(len(offers), 44)
+        self.assertEqual(len(offers), 54)
         self.assertEqual(report['inputOffers'], 294)
         self.assertEqual(report['treeOffers'], 33)
-        self.assertEqual(len({o.get('id') for o in offers}), 44)
+        self.assertEqual(len({o.get('id') for o in offers}), 54)
+        self.assertEqual(len({o.findtext('url') for o in offers}), 54)
         self.assertEqual(len({urlsplit(o.findtext('url')).path for o in offers}), 44)
         self.assertEqual({urlsplit(o.findtext('url')).path for o in offers},
                          feed.sitemap_product_paths(self.sitemap))
@@ -57,15 +58,45 @@ class YandexYMLTests(unittest.TestCase):
             self.assertTrue(o.findtext('picture','').startswith('https://'))
             self.assertIn(o.findtext('currencyId'), ('RUR','RUB'))
 
-    def test_accessory_and_bundle_defaults_identified(self):
+    def test_all_accessory_and_bundle_variants_identified(self):
         root, report=self.make()
-        stand=next(o for o in root.findall('.//offer') if o.get('id')=='293103610592')
-        self.assertIn('размер L',stand.findtext('name'))
-        self.assertEqual(stand.findtext('price'),'4290.00')
-        bundle=next(o for o in root.findall('.//offer') if o.get('id')=='927489765342')
-        self.assertIn('0,8–1 м',bundle.findtext('name'))
-        self.assertEqual(bundle.findtext('price'),'6990.00')
+        stands=[o for o in root.findall('.//offer') if o.get('group_id')=='293103610592']
+        self.assertEqual(len(stands), 3)
+        self.assertEqual({o.findtext('price') for o in stands}, {'4290.00','4990.00','6490.00'})
+        self.assertTrue(all('размер ' in o.findtext('name') for o in stands))
+        bundles=[o for o in root.findall('.//offer') if o.get('group_id')=='927489765342']
+        self.assertEqual(len(bundles), 9)
+        self.assertIn('0,8–1 м', bundles[0].findtext('name'))
+        self.assertEqual(bundles[0].findtext('price'),'6990.00')
         self.assertEqual(len(report['warnings']),2)
+
+    def test_tilda_root_accessory_and_set_paths(self):
+        def paths(data):
+            return data.replace(b'/catalog/accessories/tproduct/', b'/tproduct/').replace(b'/catalog/sets/tproduct/', b'/tproduct/')
+        root, report = self.make(source=paths(self.source), sitemap=paths(self.sitemap))
+        offers=root.findall('.//offers/offer')
+        self.assertEqual(len(offers),54)
+        self.assertEqual(report['inputProducts'],44)
+        self.assertEqual(sum(urlsplit(o.findtext('url')).path.startswith('/tproduct/') for o in offers),21)
+
+    def test_explicit_unavailability_and_zero_stock_preserved(self):
+        src=ET.fromstring(self.source)
+        target=next(o for o in src.findall('.//offer') if '293103610592-' in o.findtext('url',''))
+        eid=target.get('id')
+        target.set('available','false')
+        root,_=self.make(source=ET.tostring(src,encoding='utf-8'))
+        self.assertEqual(next(o for o in root.findall('.//offer') if o.get('id')==eid).get('available'),'false')
+        target.attrib.pop('available')
+        target.find('count').text='0'
+        root,_=self.make(source=ET.tostring(src,encoding='utf-8'))
+        self.assertEqual(next(o for o in root.findall('.//offer') if o.get('id')==eid).get('available'),'false')
+
+    def test_wrong_edition_url_fails(self):
+        src=ET.fromstring(self.source)
+        target=next(o for o in src.findall('.//offer') if '293103610592-' in o.findtext('url',''))
+        target.find('url').text=target.findtext('url').split('?')[0]+'?editionuid=999'
+        with self.assertRaisesRegex(feed.FeedError,'Edition URL'):
+            self.make(source=ET.tostring(src,encoding='utf-8'))
 
     def test_missing_selected_height_rejects_all(self):
         src=ET.fromstring(self.source)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a safe one-offer-per-canonical-product YML from the public Tilda feed.
+"""Build a safe variant-accurate YML from the public Tilda feed.
 
 No changes to Tilda, no publishing to Yandex. Python 3.9+ stdlib only.
 
@@ -16,14 +16,15 @@ import re
 import sys
 import tempfile
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
 
 SOURCE_URL = 'https://euro-elki.ru/tstore/yml/b38b27feaee313b3f633cdddfd130283.yml'
 SITEMAP_URL = 'https://euro-elki.ru/sitemap-store.xml'
 SOURCE_HOST = 'euro-elki.ru'
 MAX_XML_BYTES = 12 * 1024 * 1024
-ROOT_PRODUCT_PATH = re.compile(r'^/catalog/(?:tree|accessories|sets)/tproduct/(\d+)-[a-z0-9-]+$')
+ROOT_PRODUCT_PATH = re.compile(r'^/(?:catalog/(?:tree|accessories|sets)/)?tproduct/(\d+)-[a-z0-9-]+$')
+CATEGORY_KIND = {'882381299902': 'tree', '204963358202': 'accessories', '849870954512': 'sets'}
 RANGE_TITLE = re.compile(r'(?<!\d)(\d+(?:[.,]\d+)?)\s*[-–—]\s*(\d+(?:[.,]\d+)?)\s*(?:метра|метров|м\b)', re.I)
 RANGE_PARAM = re.compile(r'^\s*(\d+(?:[.,]\d+)?)\s*м\s*[-–—]\s*(\d+(?:[.,]\d+)?)\s*м\s*$', re.I)
 
@@ -122,41 +123,44 @@ def choose(group, path, warnings):
     title = (group[0].findtext('name') or '').strip()
     if not title or any((e.findtext('name') or '').strip() != title for e in group):
         raise FeedError('Conflicting root names for ' + path)
-    kind = path.split('/')[2]
-    expected = title_range(title)
+    categories = {e.findtext('categoryId') for e in group}
+    kind = CATEGORY_KIND.get(next(iter(categories))) if len(categories) == 1 else None
+    if not kind or (path.startswith('/catalog/') and path.split('/')[2] != kind):
+        raise FeedError('Unexpected or conflicting product category: ' + path)
     if kind == 'tree':
+        expected = title_range(title)
         if expected is None:
             raise FeedError('Cannot parse tree height in title: ' + title)
         matches = [x for x in group if offer_height(x) == expected]
         if len(matches) != 1:
             raise FeedError('Tree variant mismatch: ' + title + ' matches=' + str(len(matches)))
-        chosen = matches[0]
-    elif kind == 'sets':
-        if len(group) < 1:
-            raise FeedError('Missing set')
-        # Product page uses the first (default) edition. Advertise that edition only.
-        chosen = group[0]
-        height = offer_height(chosen)
-        if len(group) > 1:
+        return matches
+    if len(group) == 1:
+        return group
+    # Accessory sizes and bundle heights are real variants, not tree duplicates.
+    # Preserve every explicit edition and label it distinctly.
+    chosen = []
+    labels = set()
+    for original in group:
+        offer = copy.deepcopy(original)
+        if kind == 'sets':
+            height = offer_height(offer)
             if not height:
-                raise FeedError('Bundle has multiple variants but no height')
-            # A bundle has no height in its root title, so disclose the selected height.
-            clean_height = lambda n: format(n.normalize(), 'f').replace('.', ',')
-            size_label = clean_height(height[0]) + '–' + clean_height(height[1]) + ' м'
-            chosen = copy.deepcopy(chosen)
-            chosen.find('name').text = title + ' — ' + size_label
-            warnings.append('Bundle: default height published; other editions excluded')
-    elif kind == 'accessories':
-        chosen = group[0]
-        if len(group) > 1:
-            sizes = [p.text for p in chosen.findall('param') if 'размер' in (p.get('name') or '').casefold()]
+                raise FeedError('Bundle edition has no height: ' + title)
+            clean = lambda n: format(n.normalize(), 'f').replace('.', ',')
+            label = clean(height[0]) + '–' + clean(height[1]) + ' м'
+        else:
+            sizes = [(p.text or '').strip() for p in offer.findall('param')
+                     if 'размер' in (p.get('name') or '').casefold()]
             if len(sizes) != 1 or not sizes[0]:
-                raise FeedError('Accessory ambiguous default: ' + title)
-            chosen = copy.deepcopy(chosen)
-            chosen.find('name').text = title + ' — размер ' + sizes[0].strip()
-            warnings.append('Accessory '+title+': default size published; other editions excluded')
-    else:
-        raise FeedError('Unexpected product category')
+                raise FeedError('Accessory edition ambiguous size: ' + title)
+            label = 'размер ' + sizes[0]
+        if label in labels:
+            raise FeedError('Duplicate variant label: ' + title)
+        labels.add(label)
+        offer.find('name').text = title + ' — ' + label
+        chosen.append(offer)
+    warnings.append(title + ': all ' + str(len(chosen)) + ' distinct editions included')
     return chosen
 
 
@@ -167,6 +171,8 @@ def convert(feed, sitemap, *, expected_min=1):
     shop = src_root.find('shop')
     if shop is None or shop.find('offers') is None:
         raise FeedError('Missing shop/offers')
+    if (shop.findtext('url') or '').rstrip('/') != 'https://' + SOURCE_HOST:
+        raise FeedError('Unexpected shop URL')
     offers_el = shop.find('offers')
     original = list(offers_el.findall('offer'))
     if not original:
@@ -185,19 +191,40 @@ def convert(feed, sitemap, *, expected_min=1):
     warnings = []
     selected = []
     for path, group in by_path.items():
-        picked = copy.deepcopy(choose(group, path, warnings))
-        check_offer_fields(picked)
-        if picked.findtext('categoryId') not in categories:
-            raise FeedError('Unrecognized category in source: '+path)
-        if picked.findtext('currencyId') not in currencies:
-            raise FeedError('Unrecognized currency in source: '+path)
-        uid = ROOT_PRODUCT_PATH.fullmatch(path).group(1)
-        picked.set('id', uid)  # stable root product ID, never edition ID
-        picked.set('available', 'true')  # user confirmed products available to order
-        count = picked.find('count')    # Tilda stock 8000/9000 is an internal placeholder
-        if count is not None:
-            picked.remove(count)
-        selected.append(picked)
+        variants = choose(group, path, warnings)
+        for picked_original in variants:
+            picked = copy.deepcopy(picked_original)
+            check_offer_fields(picked)
+            if picked.findtext('categoryId') not in categories:
+                raise FeedError('Unrecognized category in source: '+path)
+            if picked.findtext('currencyId') not in currencies:
+                raise FeedError('Unrecognized currency in source: '+path)
+            uid = ROOT_PRODUCT_PATH.fullmatch(path).group(1)
+            edition = picked.get('id') or ''
+            if not edition.isdigit():
+                raise FeedError('Invalid edition ID: ' + path)
+            query = parse_qs(urlsplit(picked.findtext('url')).query)
+            if query.get('editionuid') != [edition] and (len(group) > 1 or 'editionuid' in query):
+                raise FeedError('Edition URL does not match offer ID: ' + path)
+            picked.set('id', edition if len(variants) > 1 else uid)
+            if len(variants) == 1:
+                picked.attrib.pop('group_id', None)
+            else:
+                picked.set('group_id', uid)
+            # Products can be ordered subject to confirmation; never transmit
+            # placeholder stock quantities or override explicit unavailability.
+            availability = picked.get('available')
+            if availability not in (None, 'true', 'false'):
+                raise FeedError('Invalid availability: ' + path)
+            count = picked.find('count')
+            if count is not None:
+                if not (count.text or '').strip().isdigit():
+                    raise FeedError('Invalid source stock: ' + path)
+                if int(count.text) == 0:
+                    availability = 'false'
+                picked.remove(count)
+            picked.set('available', availability or 'true')
+            selected.append(picked)
     ids=[o.get('id') for o in selected]
     if len(ids) != len(set(ids)):
         raise FeedError('Duplicate offer IDs')
@@ -211,8 +238,11 @@ def convert(feed, sitemap, *, expected_min=1):
     # Self-check the generated document. Fails before touching output.
     check = xmlroot(output)
     final = check.findall('.//offers/offer')
-    if len(final) != len(valid_paths) or len(final) != len(set(o.get('id') for o in final)):
-        raise FeedError('Post-generation count/ID mismatch')
+    if (len(final) != len(selected)
+            or len(final) != len(set(o.get('id') for o in final))
+            or len(final) != len(set(o.findtext('url') for o in final))
+            or {_url_path(o.findtext('url')) for o in final} != valid_paths):
+        raise FeedError('Post-generation count/ID/URL mismatch')
     return output, {'inputOffers': len(original), 'inputProducts': len(by_path), 'outputOffers': len(selected), 'treeOffers': sum('/catalog/tree/' in o.findtext('url','') for o in selected), 'warnings': warnings}
 
 
