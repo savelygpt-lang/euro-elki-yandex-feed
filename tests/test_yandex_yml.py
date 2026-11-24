@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch, MagicMock
 import copy
 import tempfile
 from pathlib import Path
@@ -126,6 +127,26 @@ class YandexYMLTests(unittest.TestCase):
                 offers.remove(o)
         with self.assertRaisesRegex(feed.FeedError,'sitemap disagree'):
             self.make(source=ET.tostring(src,encoding='utf-8'))
+
+    def test_source_retries_transient_gateway_error(self):
+        response=MagicMock()
+        response.__enter__.return_value=response
+        response.geturl.return_value=feed.SOURCE_URL
+        response.status=200
+        response.read.return_value=b'<xml/>'
+        error=feed.HTTPError(feed.SOURCE_URL,504,'Gateway Timeout',None,None)
+        with patch.object(feed,'urlopen',side_effect=[error,response]) as call, patch.object(feed.time,'sleep') as sleep:
+            self.assertEqual(feed.load_bytes(None,feed.SOURCE_URL),b'<xml/>')
+            self.assertEqual(call.call_count,2)
+            sleep.assert_called_once_with(3)
+
+    def test_source_permanent_error_is_not_retried(self):
+        error=feed.HTTPError(feed.SOURCE_URL,404,'Not Found',None,None)
+        with patch.object(feed,'urlopen',side_effect=error) as call, patch.object(feed.time,'sleep') as sleep:
+            with self.assertRaisesRegex(feed.FeedError,'404'):
+                feed.load_bytes(None,feed.SOURCE_URL)
+            self.assertEqual(call.call_count,1)
+            sleep.assert_not_called()
 
     def test_broken_xml_dtd_rejected(self):
         with self.assertRaisesRegex(feed.FeedError,'DTD'):

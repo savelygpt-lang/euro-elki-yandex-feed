@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import time
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, parse_qs
 from xml.etree import ElementTree as ET
@@ -48,13 +50,24 @@ def load_bytes(source, default_url):
         parsed = urlsplit(source)
         if parsed.scheme != 'https' or parsed.netloc.lower() != SOURCE_HOST:
             raise FeedError('Source host differs from the trusted shop')
-        request = Request(source, headers={'User-Agent': 'YandexBot/3.0 (feed verification; +https://yandex.ru/bots)', 'Accept': 'application/xml,*/*'})
-        with urlopen(request, timeout=18) as resp:
-            if urlsplit(resp.geturl()).netloc.lower() != SOURCE_HOST:
-                raise FeedError('Unexpected source redirect')
-            if resp.status != 200:
-                raise FeedError('HTTP status: ' + str(resp.status))
-            body = resp.read(MAX_XML_BYTES + 1)
+        request = Request(source, headers={'User-Agent': 'EuroElkiFeed/1.0', 'Accept': 'application/xml,text/xml,*/*'})
+        for attempt in range(4):
+            try:
+                with urlopen(request, timeout=35) as resp:
+                    if urlsplit(resp.geturl()).netloc.lower() != SOURCE_HOST:
+                        raise FeedError('Unexpected source redirect')
+                    if resp.status != 200:
+                        raise FeedError('HTTP status: ' + str(resp.status))
+                    body = resp.read(MAX_XML_BYTES + 1)
+                break
+            except (HTTPError, URLError, TimeoutError, ConnectionError) as exc:
+                if isinstance(exc, HTTPError) and exc.code not in (408, 429, 500, 502, 503, 504):
+                    raise FeedError('Source '+parsed.path+': '+str(exc)) from exc
+                if attempt == 3:
+                    raise FeedError('Source '+parsed.path+' failed after 4 attempts: '+str(exc)) from exc
+                delay = (3, 9, 20)[attempt]
+                print('Retry source '+parsed.path+' after '+str(exc)+' in '+str(delay)+'s', file=sys.stderr, flush=True)
+                time.sleep(delay)
     else:
         body = Path(source).read_bytes()
     if not body or len(body) > MAX_XML_BYTES:
