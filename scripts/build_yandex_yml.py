@@ -62,7 +62,12 @@ def load_bytes(source, default_url):
                 break
             except (HTTPError, URLError, TimeoutError, ConnectionError) as exc:
                 if isinstance(exc, HTTPError) and exc.code not in (408, 429, 500, 502, 503, 504):
-                    raise FeedError('Source '+parsed.path+': '+str(exc)) from exc
+                    # Log only selected response metadata, never cookies or response body.
+                    headers = exc.headers or {}
+                    metadata = {key: str(headers.get(key))[:160] for key in
+                                ('Server', 'Content-Type', 'X-Request-ID', 'CF-Ray')
+                                if headers.get(key)}
+                    raise FeedError('Source '+parsed.path+': '+str(exc)+'; response metadata: '+repr(metadata)) from exc
                 if attempt == 3:
                     raise FeedError('Source '+parsed.path+' failed after 4 attempts: '+str(exc)) from exc
                 delay = (3, 9, 20)[attempt]
